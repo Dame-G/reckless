@@ -563,7 +563,7 @@ fn search<NODE: NodeType>(
         return lerp(estimated_score, beta, 0.6945);
     }
 
-    // Null Move Pruning (NMP)
+    // Null Move Pruning (NMP): skip a move and search shallower; a fail-high proves the node is a cut.
     if cut_node
         && !in_check
         && !excluded
