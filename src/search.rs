@@ -564,7 +564,7 @@ fn search<NODE: NodeType>(
     }
 
     // Null Move Pruning (NMP)
-    if cut_node
+    if false && cut_node
         && !in_check
         && !excluded
         && !potential_singularity
