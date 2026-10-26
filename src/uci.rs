@@ -82,6 +82,8 @@ pub fn message_loop(mut buffer: VecDeque<String>) {
 
             // Non-UCI commands
             ["compiler"] => compiler(),
+            #[cfg(feature = "spsa")]
+            ["spsa"] => crate::parameters::print_openbench(),
             ["eval"] => eval(threads.main_thread(), &board),
             ["d"] => println!("{board}"),
             ["bench", args @ ..] => match mode {
@@ -333,8 +335,7 @@ fn set_option(threads: &mut ThreadPool, settings: &mut Settings, shared: &Arc<Sh
             println!("info string set MultiPV to {v}");
         }
         #[cfg(feature = "spsa")]
-        ["name", name, "value", v] => {
-            crate::parameters::set_parameter(name, v);
+        ["name", name, "value", v] if crate::parameters::set_parameter(name, v) => {
             println!("info string set {name} to {v}");
         }
         _ => eprintln!("Unknown option: '{}'", tokens.join(" ").trim_end()),
