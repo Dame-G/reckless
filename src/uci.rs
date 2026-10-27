@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{
     board::{Board, NullBoardObserver},
     search::Report,
-    thread::{SharedContext, Status, ThreadData},
+    thread::{Ponder, SharedContext, Status, ThreadData},
     threadpool::ThreadPool,
     time::{Limits, TimeManager},
     tools,
@@ -127,7 +127,15 @@ fn spawn_listener(shared: Arc<SharedContext>) -> std::sync::mpsc::Receiver<Strin
 
             match message.trim_end() {
                 "isready" => println!("readyok"),
-                "stop" => shared.status.set(Status::STOPPED),
+                "ponderhit" => {
+                    if shared.ponder.hit() {
+                        shared.status.set(Status::STOPPED);
+                    }
+                }
+                "stop" => {
+                    shared.ponder.stop();
+                    shared.status.set(Status::STOPPED);
+                }
                 "quit" => {
                     shared.status.set(Status::STOPPED);
                     let _ = tx.send("quit".to_string());
@@ -138,6 +146,10 @@ fn spawn_listener(shared: Arc<SharedContext>) -> std::sync::mpsc::Receiver<Strin
                     // in the current state should be ignored silently.
                     // (https://backscattering.de/chess/uci/#unexpected)
                     if shared.status.get() != Status::RUNNING {
+                        // Marked here, in order with `ponderhit` and `stop`, not when the search starts.
+                        if is_ponder_go(&message) {
+                            shared.ponder.set(Ponder::ON);
+                        }
                         let _ = tx.send(message);
                     }
                 }
@@ -158,6 +170,7 @@ fn uci() {
     println!("option name Clear Hash type button");
     println!("option name UCI_Chess960 type check default false");
     println!("option name MultiPV type spin default 1 min 1 max {MAX_MOVES}");
+    println!("option name Ponder type check default false");
 
     #[cfg(feature = "syzygy")]
     println!("option name SyzygyPath type string default");
@@ -186,23 +199,40 @@ fn reset(threads: &mut ThreadPool, shared: &Arc<SharedContext>) {
 }
 
 fn go(threads: &mut ThreadPool, settings: &Settings, board: &Board, shared: &Arc<SharedContext>, tokens: &[&str]) {
+    let ponder = tokens.contains(&"ponder");
+
     let search_moves = match parse_search_moves(board, tokens) {
         Ok(moves) => moves,
         Err(error) => {
             eprintln!("{error}");
+            shared.ponder.set(Ponder::OFF);
             return;
         }
     };
 
     if search_moves.as_ref().is_some_and(Vec::is_empty) {
+        shared.ponder.set(Ponder::OFF);
         println!("bestmove (none)");
         return;
     }
 
-    let limits = parse_limits(board.side_to_move(), tokens);
+    // A `stop` that overtook the search it was meant for leaves only a quick bestmove to give.
+    let limits = if ponder && shared.ponder.get() == Ponder::STOPPED {
+        Limits::Depth(1)
+    } else {
+        parse_limits(board.side_to_move(), tokens)
+    };
     let time_manager = TimeManager::new(limits, board.fullmove_number(), settings.move_overhead);
 
     threads.execute_searches(time_manager, settings.report, settings.multi_pv, search_moves.as_deref(), board, shared);
+
+    // While pondering, the bestmove waits for `ponderhit` or `stop`, even if the search ended first.
+    if ponder {
+        while shared.ponder.get() == Ponder::ON || shared.ponder.get() == Ponder::EXPIRED {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        shared.ponder.set(Ponder::OFF);
+    }
 
     if threads[0].root_moves.is_empty() {
         println!("bestmove (none)");
@@ -259,8 +289,33 @@ fn go(threads: &mut ThreadPool, settings: &Settings, board: &Board, shared: &Arc
         threads[best].print_uci_info(depth);
     }
 
-    println!("bestmove {}", threads[best].root_moves[0].mv.to_uci(board));
+    let best_move = threads[best].root_moves[0].mv;
+    match ponder_move(board, best_move, threads[best].root_moves[0].pv.line(), shared) {
+        Some(ponder) => println!("bestmove {} ponder {ponder}", best_move.to_uci(board)),
+        None => println!("bestmove {}", best_move.to_uci(board)),
+    }
     crate::misc::dbg_print();
+}
+
+/// The reply expected after the best move: the PV's second move, or the hash move when the PV
+/// ends early (as it does after an interrupted fail-high), provided it is legal.
+fn ponder_move(board: &Board, best_move: Move, line: &[Move], shared: &SharedContext) -> Option<String> {
+    let mut board = board.clone();
+    board.make_move(best_move, &mut NullBoardObserver);
+
+    let reply = match line.first() {
+        Some(&mv) => mv,
+        None => shared.tt.read(board.hash(), board.fiftymove_clock(), 0)?.mv,
+    };
+
+    (reply != Move::NULL && board.generate_all_moves().iter().any(|entry| entry.mv == reply) && board.is_legal(reply))
+        .then(|| reply.to_uci(&board))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_ponder_go(message: &str) -> bool {
+    let mut tokens = message.split_whitespace();
+    tokens.next() == Some("go") && tokens.any(|token| token == "ponder")
 }
 
 fn position(board: &mut Board, settings: &Settings, mut tokens: &[&str]) {
@@ -332,6 +387,8 @@ fn set_option(threads: &mut ThreadPool, settings: &mut Settings, shared: &Arc<Sh
             settings.multi_pv = v.parse().unwrap_or_default();
             println!("info string set MultiPV to {v}");
         }
+        // Pondering is driven by `go ponder`; the option only tells the GUI that it may send it.
+        ["name", "Ponder", "value", v] => println!("info string set Ponder to {v}"),
         #[cfg(feature = "spsa")]
         ["name", name, "value", v] => {
             crate::parameters::set_parameter(name, v);

@@ -141,6 +141,54 @@ impl Default for Status {
     }
 }
 
+/// The UCI pondering state. The input listener sets it as `go ponder`, `ponderhit` and `stop`
+/// arrive; the time manager reads it so that a pondering search never stops on time.
+#[derive(Default)]
+pub struct Ponder {
+    inner: AtomicUsize,
+}
+
+impl Ponder {
+    pub const OFF: usize = 0;
+    pub const ON: usize = 1;
+    /// Pondering, and a time limit has been reached: stop as soon as `ponderhit` arrives.
+    pub const EXPIRED: usize = 2;
+    /// `stop` arrived while pondering.
+    pub const STOPPED: usize = 3;
+
+    pub fn get(&self) -> usize {
+        self.inner.load(Ordering::Acquire)
+    }
+
+    pub fn set(&self, state: usize) {
+        self.inner.store(state, Ordering::Release);
+    }
+
+    /// Called when a time limit is reached. While pondering, the stop is deferred until `ponderhit`
+    /// and this returns true; otherwise it returns false and the search stops as usual.
+    pub fn defer_stop(&self) -> bool {
+        let _ = self.inner.compare_exchange(Self::ON, Self::EXPIRED, Ordering::AcqRel, Ordering::Acquire);
+        self.get() == Self::EXPIRED
+    }
+
+    /// Ends pondering on `ponderhit`. Returns true when a time limit has already been reached.
+    pub fn hit(&self) -> bool {
+        self.replace_pondering(Self::OFF) == Some(Self::EXPIRED)
+    }
+
+    /// Ends pondering on `stop`.
+    pub fn stop(&self) {
+        self.replace_pondering(Self::STOPPED);
+    }
+
+    /// Moves a pondering state (`ON` or `EXPIRED`) to `state` and returns the state it replaced.
+    fn replace_pondering(&self, state: usize) -> Option<usize> {
+        [Self::ON, Self::EXPIRED]
+            .into_iter()
+            .find(|&current| self.inner.compare_exchange(current, state, Ordering::AcqRel, Ordering::Acquire).is_ok())
+    }
+}
+
 #[derive(Default)]
 pub struct SharedCorrectionHistory {
     pub pawn: CorrectionHistory,
@@ -156,6 +204,7 @@ impl NumaReplicable for SharedCorrectionHistory {
 pub struct SharedContext {
     pub tt: TranspositionTable,
     pub status: Status,
+    pub ponder: Ponder,
     pub nodes: Counter,
     pub tb_hits: Counter,
     pub stop_probing_tb: AtomicBool,
@@ -174,6 +223,7 @@ impl Default for SharedContext {
         Self {
             tt: TranspositionTable::default(),
             status: Status::default(),
+            ponder: Ponder::default(),
             nodes: Counter::default(),
             tb_hits: Counter::default(),
             stop_probing_tb: AtomicBool::new(false),
