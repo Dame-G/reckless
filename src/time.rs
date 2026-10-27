@@ -62,12 +62,14 @@ impl TimeManager {
     }
 
     pub fn soft_limit(&self, td: &ThreadData, multiplier: impl Fn() -> f32) -> bool {
-        match self.limits {
+        let reached = match self.limits {
             Limits::Infinite | Limits::Depth(_) | Limits::Mate(_) => false,
             Limits::Nodes(maximum) => td.shared.nodes.aggregate() >= maximum,
             Limits::Time(maximum) => self.start_time.elapsed() >= Duration::from_millis(maximum),
             _ => self.start_time.elapsed() >= Duration::from_secs_f32(self.soft_bound.as_secs_f32() * multiplier()),
-        }
+        };
+
+        reached && !td.shared.ponder.defer_stop()
     }
 
     pub fn check_time(&self, td: &ThreadData) -> bool {
@@ -77,8 +79,12 @@ impl TimeManager {
 
         match self.limits {
             Limits::Infinite | Limits::Depth(_) | Limits::Mate(_) => false,
-            Limits::Nodes(maximum) => td.shared.nodes.aggregate() > maximum,
-            _ => td.nodes() & 2047 == 2047 && self.start_time.elapsed() >= self.hard_bound,
+            Limits::Nodes(maximum) => td.shared.nodes.aggregate() > maximum && !td.shared.ponder.defer_stop(),
+            _ => {
+                td.nodes() & 2047 == 2047
+                    && self.start_time.elapsed() >= self.hard_bound
+                    && !td.shared.ponder.defer_stop()
+            }
         }
     }
 
